@@ -4,202 +4,152 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an **Invoice Processing System** (发票智能筛选系统) for automated employee reimbursement at 深圳前海微众银行股份有限公司. The codebase contains **two separate implementations**:
+This repository contains an **Invoice Processing System** (发票智能筛选系统) for employee reimbursement at 深圳前海微众银行股份有限公司.
 
-1. **`invoice_processor/`** - Production-ready system (text-based PDF extraction, Markdown reports)
-2. **`invoice_reimbursement/`** - Alternative system (PaddleOCR for images, Excel reports)
+There are two implementations:
 
-Both scan PDF invoices, validate against business rules, and select optimal combinations to maximize monthly subsidy utilization.
+1. `invoice_processor/` - primary implementation (PDF text extraction + Markdown report)
+2. `invoice_reimbursement/` - alternative implementation (OCR/image-first + Excel report)
 
-## Running the Application
+Unless user asks otherwise, work on **`invoice_processor/`**.
 
-### Primary System (`invoice_processor/`)
+## Running the Primary System
 
-```bash
-# Navigate to processor directory
-cd invoice_processor
+From repo root (`D:\workspace\invoice-dqc`):
 
-# Install dependencies
-pip3 install -r requirements.txt
+```powershell
+# activate venv
+.\.venv\Scripts\Activate.ps1
 
-# Basic usage - process invoices for a specific month
-python3 main.py --month 2026-01
+# install deps
+python -m pip install -r .\invoice_processor\requirements.txt
 
-# Full parameters (from project root)
-python3 invoice_processor/main.py --month 2026-01 --invoice-pool invoice --output-dir output
+# run
+python .\invoice_processor\main.py --month 2026-02
+
+# optional args
+python .\invoice_processor\main.py --month 2026-02 --invoice-pool invoice --output-dir output
 ```
 
-**Important:** Use `python3` not `python` (python2 is default on this system).
+## Current Runtime Model (Important)
 
-### Alternative System (`invoice_reimbursement/`)
+`invoice_processor` now uses a **full rebuild** model per run:
 
-```bash
-cd invoice_reimbursement
-pip3 install -r requirements.txt  # Includes PaddleOCR (heavier)
-python3 main.py --month 2026-01 --employee "张三"
-```
+1. Clear `output/` at startup (best-effort; locked paths are skipped with warning)
+2. Read invoices **only from `invoice/*.pdf`**
+3. Recognize + validate + select
+4. Write results to `output/{month}/`, `output/unused/`, `output/errors/`
+5. Generate `output/报销报告_{month}.md`
 
-## Architecture
+### What it no longer does
 
-The primary system (`invoice_processor/`) follows a **pipeline pattern** with clear separation of concerns:
+- No incremental backup to `invoice_bak/`
+- No loading/merging historical selected invoices from `output/{month}/`
+- No moving/renaming files in `invoice/`
+
+## Architecture (`invoice_processor/`)
+
+Pipeline:
 
 ```
 main.py (CLI)
   ↓
 InvoiceProcessor (orchestrator)
-  ↓
-  ├─→ InvoiceRecognizer (pdfplumber/PyMuPDF text extraction)
-  ├─→ InvoiceValidator (business rules)
-  ├─→ InvoiceSelector (exhaustive combinatorial search)
-  ├─→ FileManager (file operations)
-  └─→ ReportGenerator (Markdown output)
+  ├─ InvoiceRecognizer (pdfplumber -> PyMuPDF fallback)
+  ├─ InvoiceValidator (business rules)
+  ├─ InvoiceSelector (combination optimization)
+  ├─ FileManager (clear output + copy files)
+  └─ ReportGenerator (Markdown report)
 ```
 
-### Data Flow
-
-1. **Backup**: Incremental copy of new files from `invoice/` to `invoice_bak/`
-2. **Load Existing**: Parse already-selected invoices from `output/{month}/` by filename pattern
-3. **Scan**: Find all PDF files in invoice pool
-4. **Recognize**: Extract invoice data via regex-based text extraction
-5. **Duplicate Check**: Track invoice numbers, mark duplicates as ERROR
-6. **Validate**: Apply business rules (date range, header, blacklist, types)
-7. **Select**: Per-type exhaustive search using `itertools.combinations`
-8. **Merge**: Combine existing + new selection results
-9. **Process Files**: Move/rename based on status
-10. **Generate Report**: Create Markdown report with statistics
-
-### Core Components
+## Core Components
 
 | File | Responsibility |
-|------|----------------|
-| `processor.py` | Main orchestrator; handles backup, merging, duplicate detection |
-| `recognizer.py` | PDF text extraction using pdfplumber (primary) or PyMuPDF (fallback) |
-| `validator.py` | Business rule validation (dates, headers, blacklist, type classification) |
-| `selector.py` | Exhaustive combinatorial optimization per invoice type |
-| `file_manager.py` | Moves/renames files based on status (SELECTED/UNUSED/ERROR) |
-| `reporter.py` | Generates Markdown reimbursement reports |
-| `models.py` | Data models (`InvoiceInfo`, `InvoiceType`, `InvoiceStatus`, `SelectionResult`) |
-| `config.py` | Business rules (subsidy limits, keywords, blacklist, company info) |
+|---|---|
+| `processor.py` | Orchestration: scan invoice pool, recognize/validate/select, write output |
+| `recognizer.py` | Extract invoice fields (date, amount, buyer/seller, items, type) |
+| `validator.py` | Rule checks (period, header/tax id, blacklist, type constraints) |
+| `selector.py` | Per-type combination selection with 30% over-limit tolerance |
+| `file_manager.py` | Clear `output/`; copy selected/unused/error files to output folders |
+| `reporter.py` | Generate and print markdown summary |
+| `models.py` | `InvoiceInfo`, `InvoiceType`, `InvoiceStatus`, `SelectionResult` |
+| `config.py` | Company info, limits, keywords, blacklist, error codes |
+
+## File Operations (Current Behavior)
+
+`FileManager` uses **copy**, not move:
+
+- `SELECTED` -> copy to `output/{month}/`
+- `UNUSED` -> copy to `output/unused/`
+- `ERROR` -> copy to `output/errors/`
+
+Source files in `invoice/` remain unchanged.
 
 ## Directory Structure
 
-```
-invoice/                         # Input: PDF invoice pool
-invoice_bak/                     # Backup: Incremental backups (only new files)
-invoice_processor/               # Primary implementation
-  ├── main.py
-  ├── processor.py
-  ├── recognizer.py
-  ├── validator.py
-  ├── selector.py
-  ├── file_manager.py
-  ├── reporter.py
-  ├── models.py
-  ├── config.py
-  └── README.md                  # Chinese user guide
-invoice_reimbursement/           # Alternative implementation (OCR-based)
-output/                          # Output base
-  ├── 2026-01/                  # Selected invoices for month
-  ├── errors/                   # Invalid invoices
-  └── 报销报告_2026-01.md        # Markdown report
+```text
+invoice/                         # input invoice pool (source of truth)
+invoice_processor/               # primary system
+invoice_reimbursement/           # alternative system
+output/
+  ├── {YYYY-MM}/                # selected invoices
+  ├── unused/                   # unused invoices
+  ├── errors/                   # invalid invoices
+  └── 报销报告_{YYYY-MM}.md      # markdown report
 ```
 
-## Business Rules (from config.py)
+## Business Rules (from `config.py`)
 
-### Subsidy Limits per Type
-- Dining (餐饮): 680.00 CNY
-- Transport (交通): 500.00 CNY
-- Communication (通讯): 300.00 CNY
+### Subsidy limits
 
-### Validation Rules
-1. **Date Range**: Invoice must be within 3-month billing period (reimbursement month ± 2 months)
-2. **Header**: Buyer name + tax ID must match company (communication allows individual names)
-3. **Blacklist**: 8 blocked suppliers (see `BLACKLIST_SUPPLIERS` in config.py)
-4. **Duplicate Detection**: Duplicate invoice numbers marked as ERROR
-5. **Type Keywords**: Each type has specific keywords (see `INVOICE_TYPES` in config.py)
+- Dining (餐饮): 680.00
+- Transport (交通): 500.00
+- Communication (通讯): 300.00
 
-### Selection Strategy
-The selector uses exhaustive search (`itertools.combinations`) prioritizing:
-1. Closest to subsidy limit (within 30% overage allowed)
-2. Fewer invoices (to save for future months)
-3. Smaller amounts when totals are similar
-4. FIFO behavior (sort by date then amount)
+### Validation highlights
 
-## File Naming Conventions
+1. Invoice date must be in allowed billing window (`ALLOWED_BILLING_PERIOD_MONTHS`, default 3)
+2. Buyer name + buyer tax id must match `COMPANY_INFO`
+3. Blacklist suppliers are rejected (`BLACKLIST_SUPPLIERS`)
+4. Duplicate invoice numbers in same run are marked duplicate (`is_duplicate=True`)
 
-The system uses English type names and omits merchant names (to avoid encoding issues):
+## Recognizer Notes
 
-- **Selected**: `{type}_{amount}_{unique_id}.pdf`
-  - Example: `dining_108.91_470541.pdf`
-- **Unused** (kept in pool): `[EXTRA]{type}_{amount}_{unique_id}.pdf`
-  - Example: `[EXTRA]dining_395.05_438781.pdf`
-- **Error** (invalid): `[ERROR-{code}]{type}_{amount}_{unique_id}.pdf`
-  - Error codes: `RECOG` (recognition failed), `DUP` (duplicate), `UNKNOWN`
-- **Duplicate**: `[ERROR-DUP]{original_filename}.pdf`
+`recognizer.py` includes:
 
-**Note**: The filename parser in `processor.py` supports both the new English format and legacy Chinese format (`餐饮_110.00元_销方名称.pdf`) for backward compatibility.
+- Date extraction fallback chain (explicit field -> near tax authority text -> generic date)
+- Buyer/seller extraction for normal and split-line layouts
+- Extra fallback for column-style name+tax-id blocks (recently added)
 
-## Key Implementation Details
+## Selection Strategy (`selector.py`)
 
-### Duplicate Invoice Handling
-- Detected in `processor.py` via `seen_invoice_numbers` tracking
-- Sets `is_duplicate=True` on `InvoiceInfo`
-- `selector.py` excludes duplicates from selection, sets `status=ERROR`
-- `models.py` generates `[ERROR-DUP]` filename prefix
-- `file_manager.py` moves duplicates to `output/errors/`
+Per type:
 
-### Filename Parsing for Incremental Processing
-Already-selected invoices are loaded from `output/{month}/` by parsing filename:
-- Supports both English (`dining_100.00_123456`) and Chinese (`餐饮_100.00元_销方`) formats
-- Extracts type and amount for merge calculation with new selections
+- Keep only valid, non-duplicate invoices
+- Try all combinations (`itertools.combinations`)
+- Target closest to type limit, allow up to `1.3 * limit`
+- Prefer fewer invoices / lower over-limit when scores tie
 
-### Invoice Type Classification
-Based on keywords in "货物或应税劳务、服务名称" field:
-- Keywords defined in `config.py` INVOICE_TYPES
-- Dining excludes: 充值权益, 会员卡, 预付卡
+## Naming Conventions (`models.py`)
 
-### Date Range Calculation
-Billing period = reimbursement month ± 2 months (implemented via `dateutil.relativedelta`):
-- For 2026-01: accepts 2025-11, 2025-12, 2026-01
+Output file naming:
 
-## Company Information
+- Selected: `{type}_{amount}_{id}.pdf`
+- Unused: `[EXTRA]{type}_{amount}_{id}.pdf`
+- Error: `[ERROR-{code}]{type}_{amount}_{id}.pdf`
+- Duplicate: `[ERROR-DUP]{original_name}`
 
-All from `config.py` COMPANY_INFO:
-- Name: 深圳前海微众银行股份有限公司
-- Tax ID: 9144030031977063XH
-- Bank: 招商银行股份有限公司深圳前海分行
-- Account: 755924276310998
+## Alternative System (`invoice_reimbursement/`)
 
-## Implementation Comparison
+Used only when explicitly requested.
 
-| Feature | invoice_processor | invoice_reimbursement |
-|---------|-------------------|----------------------|
-| OCR Engine | pdfplumber, PyMuPDF (text) | PaddleOCR, Tesseract (images) |
-| Input | PDF only | PDF, JPG, PNG |
-| Output | Markdown report | Excel report |
-| Selection | Exhaustive combinatorial | Simple validation only |
-| Duplicates | Yes | No |
-| Incremental Backup | Yes | No |
-
-## Dependencies
-
-**invoice_processor** (lightweight):
-```
-pdfplumber>=0.10.0      # PDF text extraction (primary)
-PyMuPDF>=1.23.0         # PDF text extraction (fallback)
-python-dateutil>=2.8.0  # Date calculations
-```
-
-**invoice_reimbursement** (heavier, includes PaddleOCR):
-```
-paddleocr>=2.7.0        # OCR for images
-pillow>=10.0.0          # Image processing
-pdf2image>=1.16.0       # PDF to image conversion
-pandas>=2.0.0           # Excel reports
-openpyxl>=3.1.0         # Excel file format
+```powershell
+cd .\invoice_reimbursement
+python -m pip install -r requirements.txt
+python .\main.py --month 2026-02 --employee "张三"
 ```
 
 ## Documentation
 
-- `invoice_processor/README.md` - Chinese user guide
-- `invoice_processor/发票处理规则说明.md` - Comprehensive business rules documentation
+- `invoice_processor/README.md`
+- `invoice_processor/发票处理规则说明.md`

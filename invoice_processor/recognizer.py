@@ -7,11 +7,16 @@ from pathlib import Path
 from typing import Optional
 
 from models import InvoiceInfo, InvoiceType
-from config import INVOICE_TYPES
+from config import COMPANY_INFO, INVOICE_TYPES
 
 
 class InvoiceRecognizer:
     """发票识别器"""
+
+    PARTY_NAME_PATTERN = re.compile(
+        r"([\\u4e00-\\u9fffA-Za-z0-9（）()·\\-]{2,}?"
+        r"(?:股份有限公司|有限责任公司|有限公司|分公司|个体工商户|银行|餐饮店|餐厅|饭店|门店|酒店|超市|商行|中心|公司|店))"
+    )
 
     # 正则表达式模式
     PATTERNS = {
@@ -35,6 +40,10 @@ class InvoiceRecognizer:
         "buyer_tax_id": r"购买方[^\n]*统一社会信用代码/纳税人识别号[：:]\s*([A-Z0-9]+)",
         "items": r"货物或应税劳务、服务名称[：:]?\s*([^\n]+)",
     }
+    DATE_PATTERNS = [
+        r"(20\d{2})\D+(\d{1,2})\D+(\d{1,2})",
+        r"(20\d{2})[./\-](\d{1,2})[./\-](\d{1,2})",
+    ]
 
     def __init__(self):
         """初始化识别器"""
@@ -154,14 +163,63 @@ class InvoiceRecognizer:
         return 0.0
 
     def _extract_date(self, text: str) -> Optional[datetime]:
-        """提取日期"""
+        """
+        Extract date with progressive fallback:
+        1) prefer explicit invoice-date field;
+        2) then prefer date near tax-authority keyword;
+        3) finally fallback to first valid date in full text.
+        """
+        # 1) Explicit invoice-date field first.
         match = re.search(self.PATTERNS["invoice_date"], text, re.MULTILINE)
-        if match:
-            try:
-                year, month, day = match.groups()
-                return datetime(int(year), int(month), int(day))
-            except (ValueError, IndexError):
-                pass
+        parsed = self._parse_date_match(match)
+        if parsed:
+            return parsed
+
+        # 2) Prefer date near tax authority keyword.
+        near_tax_authority = self._extract_date_near_keyword(
+            text,
+            "\u56fd\u5bb6\u7a0e\u52a1\u603b\u5c40",
+        )
+        if near_tax_authority:
+            return near_tax_authority
+
+        # 3) Final fallback: first valid date in full text.
+        return self._extract_any_date(text)
+
+    def _parse_date_match(self, match: Optional[re.Match]) -> Optional[datetime]:
+        """Safely convert regex match groups to datetime."""
+        if not match:
+            return None
+
+        try:
+            year, month, day = match.groups()
+            return datetime(int(year), int(month), int(day))
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    def _extract_any_date(self, text: str) -> Optional[datetime]:
+        """Extract first valid date from a text fragment."""
+        for pattern in self.DATE_PATTERNS:
+            match = re.search(pattern, text, re.MULTILINE)
+            parsed = self._parse_date_match(match)
+            if parsed:
+                return parsed
+        return None
+
+    def _extract_date_near_keyword(
+        self,
+        text: str,
+        keyword: str,
+        window: int = 120,
+    ) -> Optional[datetime]:
+        """Prefer a date in the neighborhood of a keyword."""
+        for key_match in re.finditer(re.escape(keyword), text):
+            start = max(0, key_match.start() - window)
+            end = min(len(text), key_match.end() + window)
+            nearby_text = text[start:end]
+            parsed = self._extract_any_date(nearby_text)
+            if parsed:
+                return parsed
         return None
 
     def _extract_items(self, text: str) -> list[str]:
@@ -265,8 +323,119 @@ class InvoiceRecognizer:
         if not seller_info["tax_id"]:
             seller_info["tax_id"] = self._extract_field(text, self.PATTERNS["seller_tax_id"])
 
+        # 方法3: 针对列式布局兜底（名称/税号分行展示）
+        if (
+            not buyer_info["name"]
+            or not seller_info["name"]
+            or not buyer_info["tax_id"]
+            or not seller_info["tax_id"]
+        ):
+            col_buyer, col_seller = self._extract_columnar_party_info(text)
+            buyer_info["name"] = buyer_info["name"] or col_buyer["name"]
+            seller_info["name"] = seller_info["name"] or col_seller["name"]
+            buyer_info["tax_id"] = buyer_info["tax_id"] or col_buyer["tax_id"]
+            seller_info["tax_id"] = seller_info["tax_id"] or col_seller["tax_id"]
+
         return buyer_info, seller_info
 
+    def _extract_columnar_party_info(self, text: str) -> tuple[dict, dict]:
+        """
+        Handle column-like buyer/seller blocks often seen in e-invoice PDFs:
+        - one line with two organization names
+        - next line with two tax IDs
+        """
+        buyer_info = {"name": None, "tax_id": None}
+        seller_info = {"name": None, "tax_id": None}
+
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+        for idx, line in enumerate(lines):
+            tax_ids = self._extract_tax_id_candidates(line)
+            if len(tax_ids) < 2:
+                continue
+
+            buyer_info["tax_id"] = tax_ids[0]
+            seller_info["tax_id"] = tax_ids[1]
+
+            name_line = self._find_name_line_before_tax_line(lines, idx)
+            if name_line:
+                names = self._split_party_names(name_line)
+                if len(names) >= 2:
+                    buyer_info["name"], seller_info["name"] = names[0], names[1]
+            break
+
+        return buyer_info, seller_info
+
+    def _extract_tax_id_candidates(self, text: str) -> list[str]:
+        """Extract tax-id-like candidates and filter obvious false positives."""
+        candidates = re.findall(r"\b[0-9A-Z]{15,20}\b", text.upper())
+        ids: list[str] = []
+        for item in candidates:
+            # Prefer identifiers containing letters to avoid matching invoice codes.
+            if not any(ch.isalpha() for ch in item):
+                continue
+            if item not in ids:
+                ids.append(item)
+        return ids
+
+    def _find_name_line_before_tax_line(self, lines: list[str], tax_line_index: int) -> Optional[str]:
+        """Search nearby previous lines for the buyer/seller name pair."""
+        skip_keywords = (
+            "统一社会信用代码",
+            "纳税人识别号",
+            "国家税务总局",
+            "税务局",
+            "发票",
+            "监制",
+            "下载次数",
+            "名称：",
+        )
+
+        for offset in range(1, 6):
+            idx = tax_line_index - offset
+            if idx < 0:
+                break
+
+            line = lines[idx]
+            if any(keyword in line for keyword in skip_keywords):
+                continue
+            if len(self._extract_tax_id_candidates(line)) > 0:
+                continue
+            if len(line) < 4:
+                continue
+            return line
+
+        return None
+
+    def _split_party_names(self, line: str) -> list[str]:
+        """Split a combined 'buyer seller' line into two organization names."""
+        normalized = re.sub(r"\s+", " ", line).strip()
+
+        # First try explicit multi-space separators.
+        chunks = [item.strip() for item in re.split(r"\s{2,}", line) if item.strip()]
+        if len(chunks) >= 2:
+            return chunks[:2]
+
+        # Then try extracting two organization-like names.
+        org_names = []
+        for name in self.PARTY_NAME_PATTERN.findall(normalized):
+            clean = name.strip(" ：:")
+            if clean and clean not in org_names:
+                org_names.append(clean)
+        if len(org_names) >= 2:
+            return org_names[:2]
+
+        # Last fallback: if known buyer company appears in the line, split around it.
+        buyer_name = COMPANY_INFO.get("name", "")
+        if buyer_name and buyer_name in normalized:
+            before, after = normalized.split(buyer_name, 1)
+            before = before.strip()
+            after = after.strip()
+            if after:
+                return [buyer_name, after]
+            if before:
+                return [before, buyer_name]
+
+        return []
     def _classify_type(self, invoice: InvoiceInfo) -> InvoiceType:
         """
         分类发票类型
